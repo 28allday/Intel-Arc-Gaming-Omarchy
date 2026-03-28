@@ -1,5 +1,13 @@
 # Intel Arc Gaming - Omarchy
 
+## Video Guide
+
+<p align="center">
+  <a href="https://youtu.be/bq5ds7XN7Vg">
+    <img src="https://img.youtube.com/vi/bq5ds7XN7Vg/0.jpg" width="700">
+  </a>
+</p>
+
 SteamOS-like gaming mode for Intel Arc discrete GPUs on [Omarchy](https://omarchy.com) (Arch Linux + Hyprland). Press `Super+Shift+S` to enter a full-screen Steam Big Picture gaming session powered by Gamescope, just like the Steam Deck.
 
 Built specifically for Intel Arc Alchemist (A770, A750, A580, A380) and Battlemage GPUs.
