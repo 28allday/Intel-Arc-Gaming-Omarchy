@@ -21,7 +21,7 @@ Built specifically for Intel Arc Alchemist (A770, A750, A580, A380) and Battlema
 ## Quick Start
 
 ```bash
-git clone https://github.com/28allday/Intel-Arc-Gaming-Omarchy.git
+git clone https://git.no-signal.uk/nosignal/Intel-Arc-Gaming-Omarchy.git
 cd Intel-Arc-Gaming-Omarchy
 chmod +x ARCGames_installv2.sh
 ./ARCGames_installv2.sh
