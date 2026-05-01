@@ -1,11 +1,12 @@
 #!/bin/bash
 #
-# ARCGames - Gaming Mode Installer for Intel Arc dGPUs
-# Version: 1.5.0
+# ARCGames - Gaming Mode Installer for Intel Arc GPUs
+# Version: 1.6.0
 #
 # Description:
-#   Sets up a SteamOS-like gaming experience on Arch Linux with Hyprland,
-#   specifically optimized for Intel Arc discrete GPUs (Alchemist, Battlemage).
+#   Sets up a SteamOS-like gaming experience on Arch Linux with Hyprland.
+#   Supports Intel Arc discrete GPUs (Alchemist DG2, Battlemage) and modern
+#   Intel Arc-branded iGPUs (Lunar Lake Xe2, Panther Lake Xe3).
 #
 # Features:
 #   - Steam and gaming dependencies installation
@@ -25,23 +26,7 @@
 
 set -uo pipefail
 
-ARCGAMES_VERSION="1.5.0"
-
-# Track mesa driver state for safe cleanup on interrupt
-_MESA_REMOVAL_IN_PROGRESS=0
-cleanup_on_exit() {
-    if [[ "$_MESA_REMOVAL_IN_PROGRESS" -eq 1 ]]; then
-        echo "" >&2
-        echo "================================================================" >&2
-        echo "  WARNING: Installation interrupted during mesa driver swap!" >&2
-        echo "  Your system may have no graphics driver installed." >&2
-        echo "  Recovery from TTY:" >&2
-        echo "    sudo pacman -S mesa lib32-mesa vulkan-intel lib32-vulkan-intel" >&2
-        echo "================================================================" >&2
-        echo "" >&2
-    fi
-}
-trap cleanup_on_exit EXIT
+ARCGAMES_VERSION="1.6.0"
 
 ###############################################################################
 #                              CONFIGURATION
@@ -64,18 +49,18 @@ if [[ -f "$CONFIG_FILE" ]]; then
         _value="${_value%"${_value##*[![:space:]]}"}"
         case "$_key" in
             PERFORMANCE_MODE) PERFORMANCE_MODE="$_value" ;;
-            USE_MESA_GIT) USE_MESA_GIT="$_value" ;;
         esac
     done < "$CONFIG_FILE" 2>/dev/null || true
 fi
 
 : "${PERFORMANCE_MODE:=enabled}"
-: "${USE_MESA_GIT:=1}"  # 1 = mesa-git from AUR (recommended), 0 = stable mesa
 
 # Global state
 NEEDS_RELOGIN=0
 INTEL_ARC_VK_DEVICE=""
 INTEL_ARC_DRM_CARD=""
+INTEL_GPU_TIER=""   # dgpu | igpu
+INTEL_GPU_GEN=""    # alchemist | battlemage | xe2 | xe3 | other
 
 # Resolve actual user (handles sudo case)
 REAL_USER="${SUDO_USER:-$USER}"
@@ -104,6 +89,10 @@ check_package() {
 check_aur_helper_functional() {
     local helper="$1"
     "$helper" --version &>/dev/null
+}
+
+is_omarchy() {
+    [[ -d "${REAL_HOME}/.local/share/omarchy" ]]
 }
 
 # Validate REAL_HOME was resolved (must be after die() is defined)
@@ -138,40 +127,15 @@ validate_environment() {
 #                           GPU DETECTION
 ###############################################################################
 
-# Check if a DRM card is an Intel iGPU (integrated) vs dGPU (discrete Arc)
+# Classify a DRM card as iGPU (on root complex) or dGPU.
+# Bus location is authoritative — Intel may brand iGPUs as "Arc" (Lunar Lake,
+# Panther Lake), so name patterns alone misclassify them.
 is_intel_igpu() {
-    local card_path="$1"
-    local device_path="$card_path/device"
-    local pci_slot=""
-
-    [[ -L "$device_path" ]] && pci_slot=$(basename "$(readlink -f "$device_path")")
+    local card_path="$1" pci_slot=""
+    [[ -L "$card_path/device" ]] && pci_slot=$(basename "$(readlink -f "$card_path/device")")
     [[ -z "$pci_slot" ]] && return 1
-
-    local device_info
-    device_info=$(lspci -s "$pci_slot" 2>/dev/null)
-
-    # Arc dGPU patterns (NOT iGPUs)
-    if echo "$device_info" | grep -iqE 'arc|alchemist|battlemage|celestial'; then
-        return 1
-    fi
-
-    # iGPU patterns
-    if echo "$device_info" | grep -iqE 'uhd|iris|hd graphics|integrated'; then
-        return 0
-    fi
-
-    # xe driver = Arc dGPU, i915 can be either
-    local driver_link="$card_path/device/driver"
-    if [[ -L "$driver_link" ]]; then
-        local driver
-        driver=$(basename "$(readlink "$driver_link")")
-        [[ "$driver" == "xe" ]] && return 1
-    fi
-
-    # Fallback: PCI bus 00 is typically iGPU
     [[ "$pci_slot" =~ ^0000:00: ]] && return 0
-
-    return 1  # Assume dGPU
+    return 1
 }
 
 # Get the Vulkan device ID (vendor:device) for a PCI slot
@@ -187,104 +151,102 @@ get_vk_device_id() {
     fi
 }
 
-# Find Intel Arc dGPU with connected display
-find_intel_arc_display_gpu() {
-    local found_arc=false
-    local arc_card=""
-    local arc_pci=""
-    local arc_has_display=false
+# Map an Intel Vulkan device ID (vendor:device) to a generation tag.
+# Used to gate gen-specific workarounds (e.g. norbc on Alchemist only).
+detect_intel_gen() {
+    local vk_id="$1"
+    local dev="${vk_id#*:}"
+    case "$dev" in
+        4f8?|4f9?|56[89ab]?|56c?) echo "alchemist" ;;   # DG2 (A-series)
+        e20?|e21?|e22?|e23?)      echo "battlemage" ;;  # BMG (B-series dGPU + iGPU)
+        64a?|64b?)                echo "xe2" ;;         # Lunar Lake iGPU
+        fd??|b0??)                echo "xe3" ;;         # Panther Lake iGPU (provisional)
+        *)                        echo "other" ;;
+    esac
+}
+
+# Walk Intel DRM cards and pick the best one for gaming.
+# Preference: dGPU with connected display > dGPU > iGPU with display > iGPU.
+find_intel_gpu() {
+    local best_card="" best_pci="" best_tier="" best_has_display=false
+
+    _consider() {
+        # $1=card $2=pci $3=tier $4=has_display
+        local rank_new rank_old
+        case "$3:$4" in
+            dgpu:true)  rank_new=4 ;;
+            dgpu:false) rank_new=3 ;;
+            igpu:true)  rank_new=2 ;;
+            igpu:false) rank_new=1 ;;
+        esac
+        case "$best_tier:$best_has_display" in
+            dgpu:true)  rank_old=4 ;;
+            dgpu:false) rank_old=3 ;;
+            igpu:true)  rank_old=2 ;;
+            igpu:false) rank_old=1 ;;
+            *)          rank_old=0 ;;
+        esac
+        if (( rank_new > rank_old )); then
+            best_card="$1" best_pci="$2" best_tier="$3" best_has_display="$4"
+        fi
+    }
 
     for card_path in /sys/class/drm/card[0-9]*; do
         local card_name
         card_name=$(basename "$card_path")
         [[ "$card_name" == render* ]] && continue
 
-        # Check for Intel GPU driver
         local driver_link="$card_path/device/driver"
         [[ -L "$driver_link" ]] || continue
-
         local driver
         driver=$(basename "$(readlink "$driver_link")")
-        [[ "$driver" == "i915" || "$driver" == "xe" ]] || continue
+        # xe-only: skip i915-bound GPUs (older UHD/Iris). Arc dGPU + Arc-branded
+        # iGPU (Xe2 Lunar Lake, Xe3 Panther Lake) all use xe.
+        [[ "$driver" == "xe" ]] || continue
 
-        # Skip iGPUs - we only want discrete Arc
-        if is_intel_igpu "$card_path"; then
-            info "Skipping Intel iGPU: $card_name"
-            continue
-        fi
-
-        # This is an Intel Arc dGPU
-        found_arc=true
-        local pci_slot
+        local pci_slot tier has_display=false
         pci_slot=$(basename "$(readlink -f "$card_path/device")")
+        if is_intel_igpu "$card_path"; then tier=igpu; else tier=dgpu; fi
 
-        # Check for connected display
         for connector in "$card_path"/"$card_name"-*/status; do
             if [[ -f "$connector" ]] && grep -q "^connected$" "$connector" 2>/dev/null; then
-                arc_card="$card_name"
-                arc_pci="$pci_slot"
-                arc_has_display=true
-                info "Intel Arc dGPU with display: $card_name (PCI: $pci_slot)"
-                break 2
+                has_display=true
+                break
             fi
         done
 
-        # Remember Arc GPU even if no display connected
-        if [[ -z "$arc_card" ]]; then
-            arc_card="$card_name"
-            arc_pci="$pci_slot"
-        fi
+        info "Found Intel GPU: $card_name (tier=$tier, pci=$pci_slot, display=$has_display)"
+        _consider "$card_name" "$pci_slot" "$tier" "$has_display"
     done
 
-    $found_arc || return 1
+    [[ -z "$best_card" ]] && return 1
 
-    # Set global variables
-    INTEL_ARC_DRM_CARD="$arc_card"
-    INTEL_ARC_VK_DEVICE=$(get_vk_device_id "$arc_pci")
+    INTEL_ARC_DRM_CARD="$best_card"
+    INTEL_ARC_VK_DEVICE=$(get_vk_device_id "$best_pci")
+    INTEL_GPU_TIER="$best_tier"
+    INTEL_GPU_GEN=$(detect_intel_gen "$INTEL_ARC_VK_DEVICE")
 
-    if $arc_has_display; then
-        info "Monitor connected to Intel Arc: $INTEL_ARC_DRM_CARD"
-    else
-        warn "No monitor detected on Intel Arc, but will use: $INTEL_ARC_DRM_CARD"
-    fi
-
-    [[ -n "$INTEL_ARC_VK_DEVICE" ]] && info "Vulkan device ID: $INTEL_ARC_VK_DEVICE"
-
+    info "Selected: $INTEL_ARC_DRM_CARD (tier=$INTEL_GPU_TIER, gen=$INTEL_GPU_GEN, vk=$INTEL_ARC_VK_DEVICE)"
+    $best_has_display || warn "No monitor detected on selected GPU"
     return 0
 }
 
-# Verify Intel Arc GPU is present and detect display GPU
-check_intel_arc() {
+# Verify a usable Intel GPU is present and select one.
+check_intel_gpu() {
     local gpu_info
     gpu_info=$(lspci 2>/dev/null | grep -iE 'vga|3d|display' || echo "")
 
-    # Verify Intel GPU presence
     if ! echo "$gpu_info" | grep -iq intel; then
-        die "No Intel GPU detected. This script is for Intel Arc dGPUs only."
+        die "No Intel GPU detected. This script targets Intel Arc dGPUs and Arc-branded iGPUs."
     fi
 
-    # Check for Arc-specific patterns
-    if ! echo "$gpu_info" | grep -iqE 'arc|alchemist|battlemage|celestial'; then
-        local has_xe=false
-        for card in /sys/class/drm/card[0-9]*/device/driver; do
-            if [[ -L "$card" ]]; then
-                local driver
-                driver=$(basename "$(readlink "$card")")
-                if [[ "$driver" == "xe" ]]; then
-                    has_xe=true
-                    break
-                fi
-            fi
-        done
-        $has_xe || warn "No Intel Arc pattern found in lspci. Checking for discrete Intel GPU..."
+    if ! find_intel_gpu; then
+        die "No xe-driven Intel GPU found.
+This script targets Intel Arc (xe driver) only. Older UHD/Iris GPUs on i915
+are intentionally ignored. Check 'lsmod | grep -E xe\\|i915' and 'lspci -k'."
     fi
 
-    # Find Arc dGPU with display
-    if ! find_intel_arc_display_gpu; then
-        die "No Intel Arc discrete GPU found. This script is for Intel Arc dGPUs only."
-    fi
-
-    info "Intel Arc dGPU detected and selected: $INTEL_ARC_DRM_CARD"
+    info "Intel GPU detected and selected: $INTEL_ARC_DRM_CARD ($INTEL_GPU_TIER/$INTEL_GPU_GEN)"
     return 0
 }
 
@@ -306,190 +268,6 @@ enable_multilib_repo() {
     fi
 }
 
-###############################################################################
-#                           MESA MANAGEMENT
-###############################################################################
-
-rollback_to_stable_mesa() {
-    info "Rolling back from mesa-git to stable mesa..."
-
-    # Identify installed mesa-git packages
-    local -a git_pkgs_to_remove=()
-    check_package "lib32-mesa-git" && git_pkgs_to_remove+=("lib32-mesa-git")
-    check_package "mesa-git" && git_pkgs_to_remove+=("mesa-git")
-
-    # Remove mesa-git packages (lib32 first due to dependency)
-    if ((${#git_pkgs_to_remove[@]})); then
-        info "Removing mesa-git packages: ${git_pkgs_to_remove[*]}"
-
-        if check_package "lib32-mesa-git"; then
-            sudo pacman -Rdd --noconfirm lib32-mesa-git 2>/dev/null || warn "Failed to remove lib32-mesa-git"
-        fi
-
-        if check_package "mesa-git"; then
-            sudo pacman -Rdd --noconfirm mesa-git 2>/dev/null || die "Failed to remove mesa-git"
-        fi
-    fi
-
-    # Install stable mesa packages
-    info "Installing stable mesa packages..."
-    local -a stable_pkgs=("mesa" "vulkan-intel" "vulkan-mesa-layers")
-
-    if grep -q "^\[multilib\]" /etc/pacman.conf 2>/dev/null; then
-        stable_pkgs+=("lib32-mesa" "lib32-vulkan-intel" "lib32-vulkan-mesa-layers")
-    fi
-
-    sudo pacman -S --needed --noconfirm "${stable_pkgs[@]}" || \
-        die "Failed to install stable mesa packages. System may be in broken state!
-    Try manually: sudo pacman -S ${stable_pkgs[*]}"
-
-    # Verify installation
-    if check_package "mesa"; then
-        info "Rollback complete - stable mesa installed"
-    else
-        die "Rollback verification failed - mesa not installed"
-    fi
-}
-
-install_mesa_git() {
-    local multilib_enabled="$1"
-
-    info "Installing mesa-git from AUR (recommended for Intel Arc)..."
-
-    # Install build tools
-    info "Ensuring build tools are installed..."
-    sudo pacman -S --needed --noconfirm base-devel git || die "Failed to install build tools"
-
-    # Find AUR helper
-    local aur_helper=""
-    if command -v yay >/dev/null 2>&1 && check_aur_helper_functional yay; then
-        aur_helper="yay"
-    elif command -v paru >/dev/null 2>&1 && check_aur_helper_functional paru; then
-        aur_helper="paru"
-    fi
-
-    [[ -z "$aur_helper" ]] && die "No AUR helper found (yay or paru required for mesa-git). Install one first:
-    git clone https://aur.archlinux.org/yay.git && cd yay && makepkg -si"
-
-    info "Using AUR helper: $aur_helper"
-
-    # Check for and remove conflicting packages
-    local -a potential_conflicts=(
-        "lib32-vulkan-mesa-implicit-layers" "lib32-vulkan-mesa-layers" "lib32-vulkan-intel" "lib32-mesa"
-        "vulkan-mesa-implicit-layers" "vulkan-mesa-layers" "vulkan-intel" "mesa"
-    )
-    local -a found_conflicts=()
-    for pkg in "${potential_conflicts[@]}"; do
-        pacman -Qi "$pkg" &>/dev/null && found_conflicts+=("$pkg")
-    done
-
-    if ((${#found_conflicts[@]})); then
-        info "Removing conflicting packages: ${found_conflicts[*]}"
-        _MESA_REMOVAL_IN_PROGRESS=1
-        # Use -Rdd to remove without dependency checks (mesa-git will satisfy deps)
-        sudo pacman -Rdd --noconfirm "${found_conflicts[@]}" || \
-            die "Failed to remove conflicting packages: ${found_conflicts[*]}. Cannot install mesa-git with conflicting packages still present."
-        # Verify removal
-        sleep 1
-        for pkg in "${found_conflicts[@]}"; do
-            if pacman -Qi "$pkg" &>/dev/null; then
-                warn "Retrying removal of $pkg..."
-                sudo pacman -Rdd --noconfirm "$pkg" || die "Failed to remove $pkg - cannot continue with mesa-git install"
-            fi
-        done
-    fi
-
-    # Clear AUR helper cache for mesa-git
-    run_as_user rm -rf "${REAL_HOME}/.cache/yay/mesa-git" 2>/dev/null || true
-    run_as_user rm -rf "${REAL_HOME}/.cache/paru/clone/mesa-git" 2>/dev/null || true
-
-    # Install mesa-git (lib32-mesa-git depends on it)
-    info "Building and installing mesa-git (this may take a while)..."
-    if ! run_as_user "$aur_helper" -S --noconfirm --removemake --cleanafter --overwrite '/usr/lib/*' \
-         --answeredit None --answerclean None --answerdiff None mesa-git; then
-        # Check for working mesa driver
-        if ! pacman -Qi mesa-git &>/dev/null && ! pacman -Qi mesa &>/dev/null; then
-            die "Failed to install mesa-git and no mesa driver is installed!
-      Run: sudo pacman -S mesa lib32-mesa vulkan-intel lib32-vulkan-intel"
-        fi
-        die "Failed to install mesa-git"
-    fi
-
-    # Verify installation
-    pacman -Qi mesa-git &>/dev/null || die "mesa-git installation verification failed"
-    info "mesa-git installed successfully"
-
-    # Install lib32-mesa-git if multilib enabled (REQUIRED for 32-bit games/Steam)
-    # NOTE: lib32-mesa-git MUST be used with mesa-git - stable lib32-vulkan-intel is incompatible!
-    if [[ "$multilib_enabled" == "true" ]]; then
-        info "Building and installing lib32-mesa-git (required for Steam)..."
-        info "This may take 10-30 minutes to compile..."
-
-        # Remove conflicting lib32 packages BEFORE attempting install
-        # This prevents the interactive "Remove lib32-mesa? [y/N]" prompt
-        # which --noconfirm defaults to N (abort)
-        local -a _lib32_conflicts=()
-        for _pkg in lib32-vulkan-mesa-implicit-layers lib32-vulkan-mesa-layers \
-                    lib32-vulkan-intel lib32-mesa; do
-            pacman -Qi "$_pkg" &>/dev/null && _lib32_conflicts+=("$_pkg")
-        done
-        if ((${#_lib32_conflicts[@]})); then
-            info "Removing conflicting lib32 packages: ${_lib32_conflicts[*]}"
-            sudo pacman -Rdd --noconfirm "${_lib32_conflicts[@]}" || \
-                die "Failed to remove conflicting lib32 packages"
-            sleep 1
-        fi
-
-        local max_attempts=2
-        local attempt=1
-        local lib32_success=false
-
-        while [[ $attempt -le $max_attempts ]] && [[ "$lib32_success" == "false" ]]; do
-            # On retries, re-check for conflicts (may have been reinstalled by failed build)
-            if [[ $attempt -gt 1 ]]; then
-                local -a _retry_conflicts=()
-                for _pkg in lib32-vulkan-mesa-implicit-layers lib32-vulkan-mesa-layers \
-                            lib32-vulkan-intel lib32-mesa; do
-                    pacman -Qi "$_pkg" &>/dev/null && _retry_conflicts+=("$_pkg")
-                done
-                if ((${#_retry_conflicts[@]})); then
-                    info "Removing conflicting lib32 packages: ${_retry_conflicts[*]}"
-                    sudo pacman -Rdd --noconfirm "${_retry_conflicts[@]}" 2>/dev/null || true
-                    sleep 1
-                fi
-            fi
-
-            # Clear AUR helper cache for lib32-mesa-git to force fresh install
-            run_as_user rm -rf "${REAL_HOME}/.cache/yay/lib32-mesa-git" 2>/dev/null || true
-            run_as_user rm -rf "${REAL_HOME}/.cache/paru/clone/lib32-mesa-git" 2>/dev/null || true
-
-            if run_as_user "$aur_helper" -S --noconfirm --removemake --cleanafter --overwrite '/usr/lib32/*' \
-                 --answeredit None --answerclean None --answerdiff None lib32-mesa-git; then
-                lib32_success=true
-                info "lib32-mesa-git installed successfully"
-            else
-                warn "lib32-mesa-git build attempt $attempt failed"
-                ((attempt++))
-                [[ $attempt -le $max_attempts ]] && info "Retrying..."
-            fi
-        done
-
-        if [[ "$lib32_success" == "false" ]]; then
-            die "Failed to install lib32-mesa-git after $max_attempts attempts.
-This is REQUIRED when using mesa-git (stable lib32-vulkan-intel is incompatible).
-
-To fix manually:
-  1. $aur_helper -S lib32-mesa-git
-
-Or rollback to stable mesa:
-  1. sudo pacman -Rdd mesa-git
-  2. sudo pacman -S mesa lib32-mesa vulkan-intel lib32-vulkan-intel"
-        fi
-    fi
-
-    _MESA_REMOVAL_IN_PROGRESS=0
-    info "mesa-git installation complete"
-}
 
 ###############################################################################
 #                        STEAM DEPENDENCIES
@@ -511,69 +289,6 @@ check_steam_dependencies() {
     if [[ ! $REPLY =~ ^[Nn]$ ]]; then
         info "Upgrading system..."
         sudo pacman -Syu --noconfirm || die "Failed to upgrade system"
-    fi
-    echo ""
-
-    #---------------------------------------------------------------------------
-    # Mesa Driver Selection
-    #---------------------------------------------------------------------------
-    local current_mesa="none"
-    local has_mesa_git=false
-
-    if check_package "mesa-git"; then
-        current_mesa="mesa-git"
-        has_mesa_git=true
-    elif check_package "mesa"; then
-        current_mesa="stable"
-    fi
-
-    echo "================================================================"
-    echo "  MESA DRIVER SELECTION"
-    echo "================================================================"
-    echo ""
-    [[ "$current_mesa" != "none" ]] && echo "  Currently installed: $current_mesa" && echo ""
-    echo "  Choose your Mesa driver:"
-    echo ""
-    echo "  [1] mesa-git (Recommended for Intel Arc)"
-    echo "      - Latest drivers from Mesa development branch"
-    echo "      - Best performance and newest fixes for Arc GPUs"
-    echo "      - Built from AUR (takes longer to install/update)"
-    echo ""
-    echo "  [2] Stable mesa"
-    echo "      - Official Arch Linux packages"
-    echo "      - Faster to install, standard updates"
-    echo "      - May lack latest Intel Arc optimizations"
-    echo ""
-    read -p "Select driver [1/2] (default: 1): " -n 1 -r mesa_choice
-    echo
-
-    if [[ "$mesa_choice" == "2" ]]; then
-        USE_MESA_GIT=0
-        info "Using stable mesa packages"
-
-        # Handle rollback if switching from mesa-git
-        if $has_mesa_git; then
-            echo ""
-            echo "================================================================"
-            echo "  ROLLBACK: mesa-git -> stable mesa"
-            echo "================================================================"
-            echo ""
-            echo "  This will:"
-            echo "    - Remove mesa-git and lib32-mesa-git"
-            echo "    - Install stable mesa, lib32-mesa, vulkan-intel, lib32-vulkan-intel"
-            echo ""
-            read -p "Proceed with rollback? [Y/n]: " -n 1 -r
-            echo
-            if [[ ! $REPLY =~ ^[Nn]$ ]]; then
-                rollback_to_stable_mesa
-            else
-                warn "Rollback cancelled - keeping mesa-git"
-                USE_MESA_GIT=1
-            fi
-        fi
-    else
-        USE_MESA_GIT=1
-        info "Using mesa-git from AUR"
     fi
     echo ""
 
@@ -607,6 +322,25 @@ check_steam_dependencies() {
     fi
 
     #---------------------------------------------------------------------------
+    # Mesa Status (stable only)
+    # Install stable mesa if no mesa is present. If mesa-git is already
+    # installed (e.g. from a previous version of this script), leave it alone.
+    #---------------------------------------------------------------------------
+    local has_mesa=false has_lib32_mesa=false
+    if check_package "mesa-git"; then
+        has_mesa=true
+        info "Mesa: mesa-git already installed (leaving as-is)"
+    elif check_package "mesa"; then
+        has_mesa=true
+        info "Mesa: stable mesa already installed"
+    else
+        info "Mesa: not installed (will install stable)"
+    fi
+    if check_package "lib32-mesa-git" || check_package "lib32-mesa"; then
+        has_lib32_mesa=true
+    fi
+
+    #---------------------------------------------------------------------------
     # Define Package Lists
     #---------------------------------------------------------------------------
     local -a core_deps=(
@@ -635,20 +369,18 @@ check_steam_dependencies() {
         "kbd"
     )
 
-    # Add stable mesa if not using mesa-git
-    if [[ "${USE_MESA_GIT:-1}" -eq 0 ]]; then
-        core_deps+=("mesa" "lib32-mesa")
+    # Stable mesa packages: only added when no mesa is currently installed.
+    if ! $has_mesa; then
+        core_deps+=("mesa" "vulkan-intel" "vulkan-mesa-layers")
+    fi
+    if $multilib_enabled && ! $has_lib32_mesa; then
+        core_deps+=("lib32-mesa" "lib32-vulkan-intel" "lib32-vulkan-mesa-layers")
     fi
 
     local -a gpu_deps=(
         "intel-media-driver"
         "vulkan-tools"
     )
-
-    # Add stable vulkan-intel if not using mesa-git
-    if [[ "${USE_MESA_GIT:-1}" -eq 0 ]]; then
-        gpu_deps+=("vulkan-intel" "lib32-vulkan-intel" "vulkan-mesa-layers")
-    fi
 
     local -a recommended_deps=(
         "gamescope"
@@ -672,34 +404,6 @@ check_steam_dependencies() {
         check_package "$dep" || missing_deps+=("$dep")
     done
 
-    # Check mesa-git packages
-    local mesa_git_needed=false
-    if [[ "${USE_MESA_GIT:-1}" -eq 1 ]]; then
-        info "Checking mesa-git (AUR)..."
-        if ! check_package "mesa-git"; then
-            mesa_git_needed=true
-            info "mesa-git: not installed (will install from AUR)"
-        else
-            local current_mesa_ver
-            current_mesa_ver=$(pacman -Q mesa-git 2>/dev/null | awk '{print $2}')
-            info "mesa-git: already installed ($current_mesa_ver)"
-            echo ""
-            read -p "Rebuild mesa-git from latest source? [y/N]: " -n 1 -r
-            echo
-            if [[ $REPLY =~ ^[Yy]$ ]]; then
-                mesa_git_needed=true
-                info "mesa-git will be rebuilt from latest source"
-            fi
-        fi
-
-        if $multilib_enabled && ! check_package "lib32-mesa-git"; then
-            mesa_git_needed=true
-            info "lib32-mesa-git: not installed (will install from AUR)"
-        elif $multilib_enabled; then
-            info "lib32-mesa-git: already installed"
-        fi
-    fi
-
     info "Checking recommended dependencies..."
     for dep in "${recommended_deps[@]}"; do
         check_package "$dep" || optional_deps+=("$dep")
@@ -713,55 +417,6 @@ check_steam_dependencies() {
     echo "  STEAM DEPENDENCY CHECK RESULTS"
     echo "================================================================"
     echo ""
-
-    # Clean missing deps array
-    local -a clean_missing=()
-    for item in "${missing_deps[@]}"; do
-        [[ -n "$item" && "$item" != "multilib-repository" ]] && clean_missing+=("$item")
-    done
-    missing_deps=("${clean_missing[@]+"${clean_missing[@]}"}")
-
-    # Show mesa driver status
-    if [[ "${USE_MESA_GIT:-1}" -eq 1 ]]; then
-        echo "  MESA DRIVER: mesa-git (Intel Arc optimized)"
-        if $mesa_git_needed; then
-            echo "    - Will be built and installed from AUR"
-        else
-            echo "    - Already installed"
-        fi
-    else
-        echo "  MESA DRIVER: Stable mesa (official packages)"
-    fi
-    echo ""
-
-    #---------------------------------------------------------------------------
-    # Install mesa-git (FIRST, before other packages)
-    #---------------------------------------------------------------------------
-    if [[ "${USE_MESA_GIT:-1}" -eq 1 ]] && $mesa_git_needed; then
-        echo "================================================================"
-        echo "  MESA-GIT INSTALLATION (AUR)"
-        echo "================================================================"
-        echo ""
-        echo "  Building mesa-git from AUR..."
-        echo "  This may take 10-30 minutes depending on your system."
-        echo ""
-        install_mesa_git "$multilib_enabled"
-        echo ""
-    fi
-
-    #---------------------------------------------------------------------------
-    # Verify mesa-git provides required vulkan drivers before continuing
-    #---------------------------------------------------------------------------
-    if [[ "${USE_MESA_GIT:-1}" -eq 1 ]]; then
-        if ! pacman -Qi mesa-git &>/dev/null; then
-            die "mesa-git is not installed. Cannot continue."
-        fi
-        if [[ "$multilib_enabled" == "true" ]] && ! pacman -Qi lib32-mesa-git &>/dev/null; then
-            die "lib32-mesa-git is not installed but is required for Steam.
-Run: yay -S lib32-mesa-git"
-        fi
-        info "Verified: mesa-git and lib32-mesa-git are installed"
-    fi
 
     #---------------------------------------------------------------------------
     # Install Missing Packages
@@ -873,6 +528,84 @@ check_steam_config() {
 }
 
 ###############################################################################
+#                          STEAM FIRST-RUN BOOTSTRAP
+###############################################################################
+
+# Detect whether Steam has been initialized for $REAL_USER (logged in once).
+# Checks both the canonical and symlinked loginusers.vdf locations.
+steam_already_bootstrapped() {
+    local f
+    for f in "${REAL_HOME}/.local/share/Steam/config/loginusers.vdf" \
+             "${REAL_HOME}/.steam/steam/config/loginusers.vdf"; do
+        [[ -s "$f" ]] && grep -q '"AccountName"' "$f" 2>/dev/null && return 0
+    done
+    return 1
+}
+
+# Run Steam in the user's graphical session, blocking until the window closes.
+# Handles three invocation modes: as the user (just exec), under sudo with the
+# user's $DISPLAY/$WAYLAND_DISPLAY visible (preserve env), or under sudo with
+# only $SUDO_USER (reconstruct XDG_RUNTIME_DIR + bus path from UID).
+launch_steam_for_user() {
+    if [[ "$EUID" -ne 0 ]]; then
+        steam
+        return $?
+    fi
+
+    [[ -z "${SUDO_USER:-}" ]] && { warn "Cannot launch Steam as root with no SUDO_USER"; return 1; }
+    local uid; uid=$(id -u "$REAL_USER")
+    sudo -u "$REAL_USER" --preserve-env=DISPLAY,WAYLAND_DISPLAY,XDG_SESSION_TYPE \
+        env XDG_RUNTIME_DIR="/run/user/${uid}" \
+            DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${uid}/bus" \
+            steam
+}
+
+bootstrap_steam_login() {
+    if steam_already_bootstrapped; then
+        info "Steam already initialized for $REAL_USER (loginusers.vdf has account entry)"
+        return 0
+    fi
+
+    if ! command -v steam >/dev/null 2>&1; then
+        warn "steam command not found — skipping bootstrap. Re-run the installer once Steam is installed."
+        return 0
+    fi
+
+    echo ""
+    echo "================================================================"
+    echo "  STEAM FIRST-RUN BOOTSTRAP"
+    echo "================================================================"
+    echo ""
+    echo "  Gaming Mode (gamescope-session-steam) expects Steam to be"
+    echo "  initialized and logged in. We'll launch Steam now so you can:"
+    echo ""
+    echo "    1. Wait for it to download/install runtime files"
+    echo "    2. Log in with your Steam account"
+    echo "    3. Close the Steam window when finished"
+    echo ""
+    echo "  This script resumes automatically after Steam exits."
+    echo ""
+    read -p "Launch Steam now? [Y/n]: " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Nn]$ ]]; then
+        warn "Skipped Steam bootstrap. Gaming Mode may fail to start until"
+        warn "you launch Steam at least once and log in."
+        return 0
+    fi
+
+    info "Launching Steam — close the window when finished..."
+    launch_steam_for_user || warn "Steam exited with non-zero status (continuing anyway)"
+
+    if steam_already_bootstrapped; then
+        info "Steam bootstrap complete — login verified"
+    else
+        warn "Steam closed but no login was detected. Gaming Mode may not"
+        warn "work until you've logged in at least once. Re-run the installer"
+        warn "or launch Steam manually to retry."
+    fi
+}
+
+###############################################################################
 #                       PERFORMANCE CONFIGURATION
 ###############################################################################
 
@@ -895,21 +628,20 @@ setup_performance_permissions() {
 
     [[ $REPLY =~ ^[Nn]$ ]] && { info "Skipping permissions setup"; return 0; }
 
-    # Udev rules for GPU frequency control
+    # Udev rules for GPU frequency control (xe driver only).
+    # Both flat (early xe: gt_*_freq_mhz) and per-tile (newer xe on Xe2/Xe3:
+    # device/tile0/gt0/freq0/*) sysfs layouts exist depending on kernel + hardware.
+    # The chmod helper tolerates absent files so a single rule covers both.
     if [[ ! -f "$udev_rules_file" ]]; then
-        info "Creating udev rules for Intel Arc performance control..."
+        info "Creating udev rules for Intel xe GPU performance control..."
         sudo tee "$udev_rules_file" > /dev/null <<'UDEV_RULES'
-# Gaming Mode Performance Control Rules - Intel Arc
-# Group-writable (video group) instead of world-writable for security
-KERNEL=="cpu[0-9]*", SUBSYSTEM=="cpu", ACTION=="add", RUN+="/bin/sh -c 'chgrp video /sys/devices/system/cpu/%k/cpufreq/scaling_governor && chmod 664 /sys/devices/system/cpu/%k/cpufreq/scaling_governor'"
-# Intel Xe driver (Arc GPUs)
-KERNEL=="card[0-9]", SUBSYSTEM=="drm", DRIVERS=="xe", ACTION=="add", RUN+="/bin/sh -c 'chgrp video /sys/class/drm/%k/gt_boost_freq_mhz && chmod 664 /sys/class/drm/%k/gt_boost_freq_mhz'"
-KERNEL=="card[0-9]", SUBSYSTEM=="drm", DRIVERS=="xe", ACTION=="add", RUN+="/bin/sh -c 'chgrp video /sys/class/drm/%k/gt_min_freq_mhz && chmod 664 /sys/class/drm/%k/gt_min_freq_mhz'"
-KERNEL=="card[0-9]", SUBSYSTEM=="drm", DRIVERS=="xe", ACTION=="add", RUN+="/bin/sh -c 'chgrp video /sys/class/drm/%k/gt_max_freq_mhz && chmod 664 /sys/class/drm/%k/gt_max_freq_mhz'"
-# Fallback for i915 driver
-KERNEL=="card[0-9]", SUBSYSTEM=="drm", DRIVERS=="i915", ACTION=="add", RUN+="/bin/sh -c 'chgrp video /sys/class/drm/%k/gt_boost_freq_mhz && chmod 664 /sys/class/drm/%k/gt_boost_freq_mhz'"
-KERNEL=="card[0-9]", SUBSYSTEM=="drm", DRIVERS=="i915", ACTION=="add", RUN+="/bin/sh -c 'chgrp video /sys/class/drm/%k/gt_min_freq_mhz && chmod 664 /sys/class/drm/%k/gt_min_freq_mhz'"
-KERNEL=="card[0-9]", SUBSYSTEM=="drm", DRIVERS=="i915", ACTION=="add", RUN+="/bin/sh -c 'chgrp video /sys/class/drm/%k/gt_max_freq_mhz && chmod 664 /sys/class/drm/%k/gt_max_freq_mhz'"
+# Gaming Mode Performance Control Rules - Intel xe driver
+# Group-writable (video group) instead of world-writable for security.
+KERNEL=="cpu[0-9]*", SUBSYSTEM=="cpu", ACTION=="add", RUN+="/bin/sh -c 'chgrp video /sys/devices/system/cpu/%k/cpufreq/scaling_governor 2>/dev/null && chmod 664 /sys/devices/system/cpu/%k/cpufreq/scaling_governor 2>/dev/null; :'"
+# Flat layout (early xe): /sys/class/drm/card*/gt_{boost,min,max}_freq_mhz
+KERNEL=="card[0-9]", SUBSYSTEM=="drm", DRIVERS=="xe", ACTION=="add", RUN+="/bin/sh -c 'for f in gt_boost_freq_mhz gt_min_freq_mhz gt_max_freq_mhz; do [ -e /sys/class/drm/%k/$f ] && chgrp video /sys/class/drm/%k/$f && chmod 664 /sys/class/drm/%k/$f; done; :'"
+# Per-tile layout (xe on Xe2/Xe3 multi-tile): device/tile*/gt*/freq*/{min,max}_freq
+KERNEL=="card[0-9]", SUBSYSTEM=="drm", DRIVERS=="xe", ACTION=="add", RUN+="/bin/sh -c 'for f in /sys/class/drm/%k/device/tile*/gt*/freq*/min_freq /sys/class/drm/%k/device/tile*/gt*/freq*/max_freq; do [ -e $f ] && chgrp video $f && chmod 664 $f; done; :'"
 UDEV_RULES
         sudo udevadm control --reload-rules || true
         sudo udevadm trigger --subsystem-match=cpu --subsystem-match=drm || true
@@ -1056,7 +788,7 @@ setup_session_switching() {
     echo ""
     echo "================================================================"
     echo "  SESSION SWITCHING SETUP (Hyprland <-> Gamescope)"
-    echo "  Intel Arc dGPU Configuration"
+    echo "  Intel Arc / Xe Gaming Configuration"
     echo "================================================================"
     echo ""
     read -p "Set up session switching? [Y/n]: " -n 1 -r
@@ -1283,28 +1015,23 @@ UDISKS_POLKIT
     local gamescope_conf="${env_dir}/gamescope-session-plus.conf"
     run_as_user mkdir -p "$env_dir"
 
-    local output_connector_line=""
-    [[ -n "$monitor_output" ]] && output_connector_line="OUTPUT_CONNECTOR=$monitor_output"
-
     run_as_user tee "$gamescope_conf" > /dev/null << GAMESCOPE_CONF
 # Gamescope Session Plus Configuration
 # Generated by ARCGames Installer v${ARCGAMES_VERSION}
-# Intel Arc dGPU Configuration
-# NOTE: environment.d format does NOT use 'export' keyword
-
-# Display configuration (managed by Steam - no hardcoded resolution)
-${output_connector_line}
+# NOTE: environment.d format does NOT use 'export' keyword.
+# Variables here apply to the systemd --user session (so also to Hyprland).
+# Gen-specific Intel workarounds live in the gamescope wrapper instead.
+# OUTPUT_CONNECTOR is picked dynamically at session start by
+# gaming-pick-connector (lid-state aware) so plugging an external display
+# in/out doesn't require reinstalling.
 
 # Adaptive sync / VRR disabled
 ADAPTIVE_SYNC=0
 
-# Intel Arc Workarounds & Optimizations
-# norbc = disable render buffer compression to avoid visual artifacts on Arc
-INTEL_DEBUG=norbc
+# Generic mesa/Vulkan tuning (safe across all Intel gens)
 DISABLE_LAYER_MESA_ANTI_LAG=1
 VKD3D_CONFIG=dxr11,dxr
 mesa_glthread=true
-ANV_QUEUE_THREAD_DISABLE=1
 
 # Storage and drive management
 STEAM_ALLOW_DRIVE_UNMOUNT=1
@@ -1318,13 +1045,33 @@ GAMESCOPE_CONF
     #---------------------------------------------------------------------------
     # Session Wrapper Script
     #---------------------------------------------------------------------------
+    # Build gen-specific Intel env block at install time so the wrapper is
+    # static at runtime. norbc is an Alchemist-only RBC artifact workaround;
+    # ANV_QUEUE_THREAD_DISABLE was a stability hack from old mesa and hurts
+    # perf on Battlemage/Xe2/Xe3 with current drivers.
+    local intel_env_lines=""
+    case "$INTEL_GPU_GEN" in
+        alchemist)
+            intel_env_lines='export INTEL_DEBUG=norbc'$'\n''export ANV_QUEUE_THREAD_DISABLE=1'
+            ;;
+        battlemage|xe2|xe3)
+            intel_env_lines='# No gen-specific workarounds needed for '"$INTEL_GPU_GEN"
+            ;;
+        *)
+            intel_env_lines='# Unknown Intel gen ('"${INTEL_GPU_GEN:-unset}"') - no workarounds applied'
+            ;;
+    esac
+
     local nm_wrapper="/usr/local/bin/gamescope-session-nm-wrapper"
-    sudo tee "$nm_wrapper" > /dev/null << 'NM_WRAPPER'
+    sudo tee "$nm_wrapper" > /dev/null << NM_WRAPPER
 #!/bin/bash
 # Gamescope session wrapper (NM + keybind monitor)
-# Intel Arc configuration is handled via environment.d config file
+# Intel gen detected at install time: ${INTEL_GPU_GEN:-unknown} (${INTEL_GPU_TIER:-unknown})
 
-log() { logger -t gamescope-wrapper "$*"; echo "$*"; }
+# Intel gen-specific environment (gamescope-only, does not leak to desktop)
+${intel_env_lines}
+
+log() { logger -t gamescope-wrapper "\$*"; echo "\$*"; }
 
 cleanup() {
     pkill -f steam-library-mount 2>/dev/null || true
@@ -1361,16 +1108,16 @@ fi
 
 if ! groups | grep -qw input; then
     log "WARNING: User not in 'input' group - Super+Shift+R keybind disabled"
-    log "Fix: sudo usermod -aG input $USER && log out/in"
+    log "Fix: sudo usermod -aG input \$USER && log out/in"
     keybind_ok=false
 fi
 
-if $keybind_ok && ! ls /dev/input/event* >/dev/null 2>&1; then
+if \$keybind_ok && ! ls /dev/input/event* >/dev/null 2>&1; then
     log "WARNING: No input devices accessible - Super+Shift+R keybind disabled"
     keybind_ok=false
 fi
 
-if $keybind_ok; then
+if \$keybind_ok; then
     /usr/local/bin/gaming-keybind-monitor &
     log "Keybind monitor started (Super+Shift+R to exit)"
 else
@@ -1383,12 +1130,34 @@ export GTK_IM_MODULE=Steam
 export STEAM_DISABLE_AUDIO_DEVICE_SWITCHING=1
 export STEAM_ENABLE_VOLUME_HANDLER=1
 
-log "Starting gamescope-session-plus (Intel Arc config via environment.d)"
+# Pick output connector at runtime (lid state + display connection).
+# Honors a manual override via /etc/gaming-mode.conf or ~/.gaming-mode.conf
+# if FORCE_OUTPUT_CONNECTOR=<name> is set.
+gm_force=""
+for gm_conf in /etc/gaming-mode.conf "\$HOME/.gaming-mode.conf"; do
+    [[ -r "\$gm_conf" ]] || continue
+    val=\$(awk -F= '/^[[:space:]]*FORCE_OUTPUT_CONNECTOR[[:space:]]*=/ {gsub(/[[:space:]]/, "", \$2); print \$2; exit}' "\$gm_conf")
+    [[ -n "\$val" ]] && gm_force="\$val"
+done
+if [[ -n "\$gm_force" ]]; then
+    export OUTPUT_CONNECTOR="\$gm_force"
+    log "Using forced connector: \$OUTPUT_CONNECTOR (FORCE_OUTPUT_CONNECTOR)"
+elif [[ -x /usr/local/bin/gaming-pick-connector ]]; then
+    chosen=\$(/usr/local/bin/gaming-pick-connector 2>/dev/null)
+    if [[ -n "\$chosen" ]]; then
+        export OUTPUT_CONNECTOR="\$chosen"
+        log "Using connector: \$OUTPUT_CONNECTOR (lid-aware autopick)"
+    else
+        log "Warning: gaming-pick-connector found no connected display"
+    fi
+fi
+
+log "Starting gamescope-session-plus (gen=${INTEL_GPU_GEN:-unknown})"
 
 /usr/share/gamescope-session-plus/gamescope-session-plus steam
-rc=$?
+rc=\$?
 
-exit "$rc"
+exit "\$rc"
 NM_WRAPPER
     sudo chmod +x "$nm_wrapper"
 
@@ -1398,7 +1167,7 @@ NM_WRAPPER
     local session_desktop="/usr/share/wayland-sessions/gamescope-session-steam-nm.desktop"
     sudo tee "$session_desktop" > /dev/null << 'SESSION_DESKTOP'
 [Desktop Entry]
-Name=Gaming Mode (Intel Arc)
+Name=Gaming Mode
 Comment=Steam Big Picture with gamescope-session
 Exec=/usr/local/bin/gamescope-session-nm-wrapper
 Type=Application
@@ -1561,7 +1330,7 @@ handle_device() {
 }
 
 shopt -s nullglob
-for dev in /dev/sd*[0-9]* /dev/nvme*p[0-9]*; do
+for dev in /dev/sd*[0-9]* /dev/nvme*p[0-9]* /dev/mmcblk*p[0-9]*; do
     [[ -b "$dev" ]] && handle_device "$dev"
 done
 shopt -u nullglob
@@ -1582,6 +1351,97 @@ udevadm monitor --kernel --property --subsystem-match=block 2>/dev/null | while 
 done
 STEAM_MOUNT
     sudo chmod +x "$steam_mount_script"
+
+    #---------------------------------------------------------------------------
+    # Output Connector Picker (lid-aware)
+    #
+    # Picks a DRM connector for gamescope at session start. Logic:
+    #   lid closed  -> prefer external (HDMI/DP), fall back to any connected
+    #   lid open    -> prefer internal (eDP/LVDS/DSI), fall back to external
+    #   no lid      -> any connected (desktop case)
+    # Lid state is read from /proc/acpi/button/lid/<id>/state when present.
+    # Connector status from /sys/class/drm/card*-*/status (Omarchy-style).
+    #---------------------------------------------------------------------------
+    local pick_connector_script="/usr/local/bin/gaming-pick-connector"
+    sudo tee "$pick_connector_script" > /dev/null << 'PICK_CONNECTOR'
+#!/bin/bash
+# gaming-pick-connector — print the best DRM connector for gamescope.
+# Scoped to the xe-bound DRM card (matches the GPU the installer selected).
+# Empty output means no connected display was found.
+
+set -u
+
+is_internal() {
+    case "$1" in
+        eDP-*|eDP*|LVDS-*|LVDS*|DSI-*|DSI*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Find the xe-bound card. If multiple are xe (e.g. Battlemage dGPU + Xe2/Xe3
+# iGPU), prefer the dGPU (PCI bus != 00) — matches find_intel_gpu().
+pick_xe_card() {
+    local best_card="" best_is_dgpu=-1
+    for d in /sys/class/drm/card[0-9]*; do
+        local n; n=$(basename "$d")
+        [[ "$n" == render* ]] && continue
+        [[ -L "$d/device/driver" ]] || continue
+        local drv; drv=$(basename "$(readlink "$d/device/driver")")
+        [[ "$drv" == "xe" ]] || continue
+        local pci; pci=$(basename "$(readlink -f "$d/device")")
+        local is_dgpu=1
+        [[ "$pci" =~ ^0000:00: ]] && is_dgpu=0
+        if (( is_dgpu > best_is_dgpu )); then
+            best_card="$n"
+            best_is_dgpu=$is_dgpu
+        fi
+    done
+    echo "$best_card"
+}
+
+xe_card=$(pick_xe_card)
+# Fallback: if no xe card found (shouldn't happen post-install), scan all
+glob_root="${xe_card:-card*}"
+
+# Lid state: open / closed / unknown
+lid_state="unknown"
+for f in /proc/acpi/button/lid/*/state; do
+    [[ -r "$f" ]] || continue
+    case "$(awk '{print $NF}' "$f" 2>/dev/null)" in
+        closed) lid_state="closed" ;;
+        open)   lid_state="open" ;;
+    esac
+    break
+done
+
+# Collect connected connectors on the chosen card only
+connected=()
+for status in /sys/class/drm/${glob_root}-*/status; do
+    [[ -r "$status" ]] || continue
+    [[ "$(<"$status")" == "connected" ]] || continue
+    name="$(basename "${status%/status}")"
+    name="${name#card*-}"
+    connected+=("$name")
+done
+
+(( ${#connected[@]} == 0 )) && exit 0
+
+# Split into internal vs external preserving order
+internal=() external=()
+for c in "${connected[@]}"; do
+    if is_internal "$c"; then internal+=("$c"); else external+=("$c"); fi
+done
+
+# Pick by lid state
+if [[ "$lid_state" == "closed" ]]; then
+    if (( ${#external[@]} > 0 )); then echo "${external[0]}"; exit 0; fi
+    (( ${#internal[@]} > 0 )) && echo "${internal[0]}"; exit 0
+fi
+# lid open or unknown (desktop): prefer internal, fall back to external
+if (( ${#internal[@]} > 0 )); then echo "${internal[0]}"; exit 0; fi
+(( ${#external[@]} > 0 )) && echo "${external[0]}"
+PICK_CONNECTOR
+    sudo chmod +x "$pick_connector_script"
 
     #---------------------------------------------------------------------------
     # SDDM Configuration
@@ -1633,32 +1493,66 @@ SUDOERS_SWITCH
 
     #---------------------------------------------------------------------------
     # Hyprland Keybind
+    #
+    # Combo: SUPER SHIFT, S. The screenshot template at this combo is
+    # commented out by default in Omarchy's bindings.conf (Print Screen key
+    # handles screenshots), so the combo is free in practice. SUPER SHIFT, G
+    # is taken by Signal in Omarchy.
+    #
+    # Exec is wrapped with `uwsm-app --` on Omarchy so the helper runs under
+    # the user's uwsm graphical session like every other Omarchy launcher.
     #---------------------------------------------------------------------------
     local hypr_bindings_conf="${user_home}/.config/hypr/bindings.conf"
     local hypr_main_conf="${user_home}/.config/hypr/hyprland.conf"
     local keybind_target=""
 
-    # Determine where to add the keybind
     if [[ -f "$hypr_bindings_conf" ]]; then
         keybind_target="$hypr_bindings_conf"
     elif [[ -f "$hypr_main_conf" ]]; then
         keybind_target="$hypr_main_conf"
     fi
 
-    if [[ -n "$keybind_target" ]] && ! grep -q "switch-to-gaming" "$keybind_target" 2>/dev/null; then
-        run_as_user tee -a "$keybind_target" > /dev/null << 'HYPR_GAMING'
+    # Build the keybind line — uwsm-app wrapping if available (Omarchy convention)
+    local keybind_exec="/usr/local/bin/switch-to-gaming"
+    if command -v uwsm-app >/dev/null 2>&1; then
+        keybind_exec="uwsm-app -- /usr/local/bin/switch-to-gaming"
+    fi
+    local keybind_line="bindd = SUPER SHIFT, S, Gaming Mode, exec, ${keybind_exec}"
+
+    # Collision pre-check across all sourced binding files (Omarchy + user).
+    # Active (uncommented) lines only — Omarchy's screenshot template at this
+    # combo is commented out by default and doesn't count as a collision.
+    local -a binding_sources=()
+    [[ -d "${user_home}/.local/share/omarchy/default/hypr/bindings" ]] && \
+        while IFS= read -r f; do binding_sources+=("$f"); done < <(find "${user_home}/.local/share/omarchy/default/hypr/bindings" -name '*.conf' 2>/dev/null)
+    [[ -f "$hypr_bindings_conf" ]] && binding_sources+=("$hypr_bindings_conf")
+    [[ -f "$hypr_main_conf" ]] && binding_sources+=("$hypr_main_conf")
+    local collision=""
+    if ((${#binding_sources[@]})); then
+        collision=$(grep -hE '^bindd? = SUPER SHIFT, S,' "${binding_sources[@]}" 2>/dev/null | head -1)
+    fi
+    if [[ -n "$collision" && "$collision" != *"switch-to-gaming"* ]]; then
+        warn "SUPER SHIFT, S is already bound: ${collision}"
+        warn "Skipping keybind install. Add manually with a free combo:"
+        warn "  ${keybind_line}"
+    elif [[ -n "$keybind_target" ]] && ! grep -q "switch-to-gaming" "$keybind_target" 2>/dev/null; then
+        run_as_user tee -a "$keybind_target" > /dev/null << HYPR_GAMING
 
 # Gaming Mode - Switch to Gamescope session (Intel Arc)
-bindd = SUPER SHIFT, S, Gaming Mode, exec, /usr/local/bin/switch-to-gaming
+${keybind_line}
 HYPR_GAMING
         info "Added Gaming Mode keybind to $(basename "$keybind_target")"
     elif [[ -z "$keybind_target" ]]; then
         warn "No Hyprland config found - please add keybind manually:"
-        warn "  bindd = SUPER SHIFT, S, Gaming Mode, exec, /usr/local/bin/switch-to-gaming"
+        warn "  ${keybind_line}"
     fi
 
-    # Reload Hyprland
-    command -v hyprctl >/dev/null 2>&1 && hyprctl monitors >/dev/null 2>&1 && hyprctl reload >/dev/null 2>&1
+    # Reload Hyprland — prefer omarchy-restart-hyprctl on Omarchy
+    if is_omarchy && command -v omarchy-restart-hyprctl >/dev/null 2>&1; then
+        run_as_user omarchy-restart-hyprctl >/dev/null 2>&1 || true
+    elif command -v hyprctl >/dev/null 2>&1 && hyprctl monitors >/dev/null 2>&1; then
+        hyprctl reload >/dev/null 2>&1 || true
+    fi
 
     #---------------------------------------------------------------------------
     # Done
@@ -1683,16 +1577,17 @@ execute_setup() {
     sudo -v || die "sudo authentication required"
 
     validate_environment
-    check_intel_arc
+    check_intel_gpu
 
     echo ""
     echo "================================================================"
     echo "  ARCGames INSTALLER v${ARCGAMES_VERSION}"
-    echo "  Intel Arc dGPU Gaming Mode Setup"
+    echo "  Intel Arc Gaming Mode Setup (dGPU + Xe2/Xe3 iGPU)"
     echo "================================================================"
     echo ""
 
     check_steam_dependencies
+    bootstrap_steam_login
     setup_requirements
     setup_session_switching
 
@@ -1720,110 +1615,25 @@ show_help() {
     cat << EOF
 ARCGames Installer v${ARCGAMES_VERSION}
 
-Gaming Mode installer for Intel Arc discrete GPUs.
+Gaming Mode installer for Intel Arc GPUs (dGPU and Xe2/Xe3 iGPU).
 
 Usage: $0 [OPTIONS]
 
 Options:
   --help, -h      Show this help message
   --version       Show version number
-  --rebuild-mesa  Rebuild mesa-git from latest upstream source
 
 EOF
 }
 
-###############################################################################
-#                          MESA-GIT REBUILD
-###############################################################################
-
-rebuild_mesa_git() {
-    info "Mesa-git rebuild requested"
-
-    # Check if mesa-git is actually installed
-    if ! check_package "mesa-git"; then
-        die "mesa-git is not installed. Run the full installer first, or use: yay -S mesa-git"
-    fi
-
-    # Find AUR helper
-    local aur_helper=""
-    command -v yay >/dev/null 2>&1 && check_aur_helper_functional yay && aur_helper="yay"
-    [[ -z "$aur_helper" ]] && command -v paru >/dev/null 2>&1 && check_aur_helper_functional paru && aur_helper="paru"
-    [[ -z "$aur_helper" ]] && die "No AUR helper found (yay or paru required)"
-
-    info "Using AUR helper: $aur_helper"
-
-    # Show current mesa-git version
-    local current_ver
-    current_ver=$(pacman -Qi mesa-git 2>/dev/null | grep "^Version" | awk '{print $3}')
-    info "Current mesa-git version: $current_ver"
-
-    echo ""
-    echo "================================================================"
-    echo "  MESA-GIT REBUILD"
-    echo "================================================================"
-    echo ""
-    echo "  This will rebuild mesa-git from the latest upstream source."
-    echo "  Build time: typically 10-30 minutes per package."
-    echo ""
-
-    local -a packages=("mesa-git")
-    if check_package "lib32-mesa-git"; then
-        packages+=("lib32-mesa-git")
-        echo "  Packages to rebuild: mesa-git, lib32-mesa-git"
-    else
-        echo "  Package to rebuild: mesa-git"
-    fi
-    echo ""
-
-    read -p "Proceed with rebuild? [Y/n]: " -n 1 -r
-    echo
-    [[ $REPLY =~ ^[Nn]$ ]] && { info "Rebuild cancelled"; return 0; }
-
-    # Clear AUR helper cache to force fresh build
-    for pkg in "${packages[@]}"; do
-        run_as_user rm -rf "${REAL_HOME}/.cache/yay/${pkg}" 2>/dev/null || true
-        run_as_user rm -rf "${REAL_HOME}/.cache/paru/clone/${pkg}" 2>/dev/null || true
-    done
-
-    # Rebuild mesa-git
-    info "Rebuilding mesa-git from latest source..."
-    if ! run_as_user "$aur_helper" -S --noconfirm --rebuild --removemake --cleanafter \
-         --overwrite '/usr/lib/*' --answeredit None --answerclean None --answerdiff None mesa-git; then
-        die "Failed to rebuild mesa-git"
-    fi
-    info "mesa-git rebuilt successfully"
-
-    # Rebuild lib32-mesa-git if installed
-    if check_package "lib32-mesa-git"; then
-        info "Rebuilding lib32-mesa-git from latest source..."
-        if ! run_as_user "$aur_helper" -S --noconfirm --rebuild --removemake --cleanafter \
-             --overwrite '/usr/lib32/*' --answeredit None --answerclean None --answerdiff None lib32-mesa-git; then
-            die "Failed to rebuild lib32-mesa-git"
-        fi
-        info "lib32-mesa-git rebuilt successfully"
-    fi
-
-    # Show new version
-    local new_ver
-    new_ver=$(pacman -Qi mesa-git 2>/dev/null | grep "^Version" | awk '{print $3}')
-    echo ""
-    echo "================================================================"
-    echo "  MESA-GIT REBUILD COMPLETE"
-    echo "================================================================"
-    echo ""
-    echo "  Previous version: $current_ver"
-    echo "  New version:      $new_ver"
-    echo ""
-}
 
 ###############################################################################
 #                           COMMAND LINE HANDLING
 ###############################################################################
 
 case "${1:-}" in
-    --help|-h)       show_help; exit 0 ;;
-    --version)       echo "ARCGames Installer v${ARCGAMES_VERSION}"; exit 0 ;;
-    --rebuild-mesa)  rebuild_mesa_git ;;
-    "")              execute_setup ;;
-    *)               echo "Unknown option: $1"; exit 1 ;;
+    --help|-h)  show_help; exit 0 ;;
+    --version)  echo "ARCGames Installer v${ARCGAMES_VERSION}"; exit 0 ;;
+    "")         execute_setup ;;
+    *)          echo "Unknown option: $1"; exit 1 ;;
 esac

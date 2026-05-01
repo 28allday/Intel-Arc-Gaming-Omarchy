@@ -8,15 +8,17 @@
   </a>
 </p>
 
-SteamOS-like gaming mode for Intel Arc discrete GPUs on [Omarchy](https://omarchy.com) (Arch Linux + Hyprland). Press `Super+Shift+S` to enter a full-screen Steam Big Picture gaming session powered by Gamescope, just like the Steam Deck.
+SteamOS-like gaming mode for Intel Arc on [Omarchy](https://omarchy.com) (Arch Linux + Hyprland). Press `Super+Shift+S` to enter a full-screen Steam Big Picture session powered by Gamescope, just like the Steam Deck.
 
-Built specifically for Intel Arc Alchemist (A770, A750, A580, A380) and Battlemage GPUs.
+Supports Intel Arc **discrete** GPUs (Alchemist DG2, Battlemage) **and** modern **Intel Arc-branded iGPUs** (Lunar Lake Xe2, Panther Lake Xe3) — anything driven by the `xe` kernel driver.
 
 ## Requirements
 
-- **OS**: [Omarchy](https://omarchy.com) (Arch Linux)
-- **GPU**: Intel Arc discrete GPU (Alchemist or Battlemage)
+- **OS**: [Omarchy](https://omarchy.com) (Arch Linux + Hyprland)
+- **GPU**: Intel Arc on the `xe` kernel driver (see support matrix below)
 - **AUR Helper**: yay or paru
+
+> Older UHD/Iris GPUs on the `i915` driver are intentionally **not supported** — they're under-spec for Gaming Mode and the script's GPU detection is xe-only.
 
 ## Quick Start
 
@@ -31,59 +33,82 @@ After installation, press **Super+Shift+S** to enter Gaming Mode.
 
 ## What It Does
 
-### 1. Installs Gaming Dependencies
+### 1. GPU detection (xe-only, bus-based, gen-aware)
 
-- Steam and 32-bit libraries
+The selector walks `/sys/class/drm/card[0-9]*` and considers only `xe`-bound devices. It classifies each card by **PCI bus location** (bus `00` = iGPU, anything else = dGPU) — name patterns alone misclassify Intel because Intel reuses the "Arc B-series" brand for the Xe3-LPG iGPUs in Panther Lake.
+
+Selection ranking:
+
+1. dGPU with a connected display (best)
+2. dGPU without display
+3. iGPU with display
+4. iGPU without display
+
+The chosen card's Vulkan device ID is then mapped to a generation tag (`alchemist`, `battlemage`, `xe2`, `xe3`, `other`) which gates gen-specific workarounds in the gamescope wrapper.
+
+### 2. Installs gaming dependencies
+
+- Steam (multilib) and 32-bit libraries
 - Gamescope (Steam Deck compositor)
+- ChimeraOS `gamescope-session-git` + `gamescope-session-steam-git` (auto-installed; `-steam` reinstalled if Steam compat scripts like `steamos-session-select` are missing)
 - MangoHud (FPS overlay)
-- GameMode (performance optimizer)
-- Vulkan drivers for Intel Arc
+- GameMode (performance optimiser)
+- Vulkan ICDs for Intel (`vulkan-intel`, `lib32-vulkan-intel`)
 
-### 2. Mesa Driver Selection
+> Note: As of v1.6.0 the script no longer manages Mesa drivers. The previous `mesa-git` swap and `USE_MESA_GIT` config option have been removed — the script uses whichever Mesa is installed on the system. Arc support in stable Mesa has matured enough that the swap is no longer worth the risk of leaving the box without a graphics driver mid-install.
 
-| Option | Description |
-|--------|-------------|
-| **mesa-git** (default) | Latest development build from AUR — best Intel Arc support |
-| **mesa stable** | Official Arch repo version — more stable but may lag on Arc features |
+### 3. Steam first-run bootstrap
 
-Mesa-git is recommended for Intel Arc because Arc GPU support is actively being improved in Mesa's development branch.
+Gaming Mode (`gamescope-session-steam`) expects Steam to already be initialised and logged in. The installer launches Steam interactively, waits for it to download runtime files and for you to log in, then resumes. You can decline (`n`) to skip — Gaming Mode will fail to start until you've logged into Steam at least once manually.
 
-### 3. Gaming Mode Session
+### 4. Gen-specific workarounds (gamescope wrapper)
 
-Same session switching mechanism as Super-Shift-S-Omarchy-Deck-Mode, adapted for Intel Arc:
+The gamescope wrapper sets generation-specific Intel env vars based on `INTEL_GPU_GEN` detected at install time:
 
-- **Super+Shift+S** — Switch from Hyprland to Gaming Mode (Gamescope + Steam Big Picture)
-- **Super+Shift+R** — Return from Gaming Mode to Hyprland desktop
-- Steam's **Power > Exit to Desktop** also works
+| Gen | Env vars |
+|-----|----------|
+| `alchemist` | `INTEL_DEBUG=norbc`, `ANV_QUEUE_THREAD_DISABLE=1` (disable Render Buffer Compression to avoid visual artifacts; ANV thread workaround) |
+| `battlemage`, `xe2`, `xe3` | None — current Mesa handles these cleanly |
+| `other` | None |
 
-### 4. Performance Tuning
+### 5. Gaming Mode session
 
-- GPU performance mode for Intel Arc
-- CPU governor set to performance during gaming
+Same session-switching mechanism as the NVIDIA/AMD variants:
+
+- **Super+Shift+S** — switch from Hyprland to Gaming Mode
+- **Super+Shift+R** — return from Gaming Mode to Hyprland
+- Steam's **Power → Exit to Desktop** also works
+
+### 6. Performance tuning
+
+- Intel GPU pinned to performance mode
+- CPU governor set to `performance` during gaming
 - PipeWire low-latency audio configuration
-- Shader cache optimization (12GB Mesa/DXVK cache)
-- Memory lock limits for esync/fsync
+- Shader cache optimisation (12 GB Mesa/DXVK cache)
+- Memory lock limits raised for esync/fsync
 
-### 5. External Drive Support
+### 7. External drive support
 
-Auto-detects and mounts drives containing Steam libraries during Gaming Mode. Supports ext4, NTFS, btrfs, exFAT, and more.
+Auto-detects and mounts drives containing Steam libraries during Gaming Mode (ext4, NTFS, btrfs, exFAT, …).
 
-### 6. NetworkManager Integration
+### 8. NetworkManager integration
 
-Handles the iwd-to-NetworkManager handoff that Steam requires for its network settings UI (same approach as the NVIDIA version).
+Handles the `iwd` → NetworkManager handoff that Steam needs for its network settings UI (same approach as the NVIDIA/AMD variants).
 
 ## Supported Intel Arc GPUs
 
-| Series | GPUs | Codename |
-|--------|------|----------|
-| **Battlemage** | B580, B570 | Xe2 |
-| **Alchemist** | A770, A750, A580, A380, A310 | Xe HPG |
+| Tier | Series | GPUs | Codename | Driver |
+|------|--------|------|----------|--------|
+| **dGPU** | Battlemage | B580, B570 | Xe2 (BMG) | `xe` |
+| **dGPU** | Alchemist | A770, A750, A580, A380, A310 | Xe HPG (DG2) | `xe` |
+| **iGPU** | Panther Lake | Arc B360 / B370 / B380 / B390 (Core Ultra 300, Jan 2026) | Xe3-LPG | `xe` |
+| **iGPU** | Lunar Lake | Arc 130V / 140V (Core Ultra 200V) | Xe2 | `xe` |
 
-> **Note:** Intel integrated GPUs (UHD, Iris Xe) are NOT supported for Gaming Mode. A discrete Intel Arc GPU is required.
+**Not supported:** older UHD/Iris (Gen 9–12.5 on `i915`). The script will refuse to run if no `xe`-driven Intel GPU is found.
 
 ## Usage
 
-### Command-Line Options
+### Command-line options
 
 ```bash
 ./ARCGames_installv2.sh              # Full installation
@@ -91,13 +116,13 @@ Handles the iwd-to-NetworkManager handoff that Steam requires for its network se
 ./ARCGames_installv2.sh --help       # Show help
 ```
 
-### After Installation
+### After installation
 
 | Action | Keybind |
 |--------|---------|
 | Enter Gaming Mode | `Super + Shift + S` |
 | Return to Desktop | `Super + Shift + R` |
-| Exit (fallback) | Steam > Power > Exit to Desktop |
+| Exit (fallback) | Steam → Power → Exit to Desktop |
 
 ## Configuration
 
@@ -105,8 +130,9 @@ Edit `/etc/gaming-mode.conf` or `~/.gaming-mode.conf`:
 
 ```bash
 PERFORMANCE_MODE=enabled    # Set to "disabled" to skip performance tuning
-USE_MESA_GIT=1              # 1 = mesa-git (AUR), 0 = stable mesa
 ```
+
+> The previous `USE_MESA_GIT` option was removed in v1.6.0 along with the Mesa-management section.
 
 ## Uninstalling
 
@@ -121,54 +147,62 @@ The uninstaller supports `--dry-run` to preview what would be removed:
 ./ARCGames_uninstall.sh --dry-run
 ```
 
-### What Gets Removed
+### What gets removed
 
-- All gaming mode scripts (`/usr/local/bin/switch-to-*`, `gaming-*`, etc.)
+- All gaming-mode scripts (`/usr/local/bin/switch-to-*`, `gaming-*`, etc.)
 - Udev rules, sudoers files, polkit rules
 - SDDM gaming session config
 - PipeWire, shader cache, and memlock configs
-- Hyprland gaming mode keybind
+- Hyprland gaming-mode keybind
 - Gamescope capabilities
 
-### What Is NOT Removed
+### What is NOT removed
 
-- Installed packages (Steam, mesa-git, gamescope)
+- Installed packages (Steam, gamescope, etc.)
 - User game data and Steam libraries
 - User group memberships
-
-## Mesa-git Recovery
-
-If the installer is interrupted during the mesa driver swap, your system may have no graphics driver. Recover from a TTY:
-
-```bash
-sudo pacman -S mesa lib32-mesa vulkan-intel lib32-vulkan-intel
-```
 
 ## Troubleshooting
 
 ### Gaming Mode doesn't start / black screen
 
-- Verify Intel Arc is detected: `lspci | grep -i "arc\|alchemist\|battlemage"`
-- Check Vulkan works: `vulkaninfo --summary`
-- Check session logs: `journalctl --user -u gamescope-session -n 50`
+```bash
+# Verify the right Intel GPU is detected
+lspci -k | grep -A2 -iE 'vga|3d|display'
 
-### Poor performance / stuttering
+# Confirm xe is the bound driver
+lsmod | grep -E '^xe '
 
-- Make sure mesa-git is installed: `pacman -Q mesa-git`
-- Check GPU frequency: `sudo intel_gpu_top`
-- Verify GameMode is active: `gamemoded -s`
+# Check Vulkan can see the Arc
+vulkaninfo --summary
 
-### Steam shows wrong GPU
+# Session logs
+journalctl --user -u gamescope-session -n 100
+```
 
-- Check Intel Arc Vulkan device is selected in the launcher script
-- Verify with: `vulkaninfo | grep deviceName`
+### Poor performance / stuttering on Alchemist
+
+The Alchemist gen-specific block sets `INTEL_DEBUG=norbc` to disable Render Buffer Compression (a known source of visual artifacts on DG2). If you've manually edited the gamescope wrapper, make sure that line is still present.
+
+### Steam shows wrong GPU on a hybrid system (iGPU + dGPU)
+
+The selector prefers a dGPU with display when one is present. If your monitor is plugged into the iGPU port instead of the dGPU port, the iGPU will win the selection — re-cable to the dGPU's outputs and re-run the installer, or set the GPU manually in the gamescope wrapper.
+
+```bash
+# See which Intel GPUs the script considered and which it picked
+./ARCGames_installv2.sh 2>&1 | grep -E 'Found Intel GPU|Selected:'
+```
+
+### Steam runs but Gaming Mode immediately drops to desktop
+
+Almost always means Steam isn't logged in (`gamescope-session-steam` requires an existing session). Re-run the installer or launch Steam manually and complete login.
 
 ## Credits
 
-- [Omarchy](https://omarchy.com) - The Arch Linux distribution this was built for
-- [Valve](https://store.steampowered.com/) - Steam, Gamescope, and the Steam Deck
-- [ChimeraOS](https://chimeraos.org/) - gamescope-session packages
-- [Mesa](https://mesa3d.org/) - Open-source GPU drivers
+- [Omarchy](https://omarchy.com) — the Arch Linux distribution this was built for
+- [Valve](https://store.steampowered.com/) — Steam, Gamescope, and the Steam Deck
+- [ChimeraOS](https://chimeraos.org/) — `gamescope-session` packages
+- [Mesa](https://mesa3d.org/) — open-source GPU drivers
 
 ## License
 
