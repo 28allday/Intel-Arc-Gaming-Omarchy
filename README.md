@@ -23,7 +23,7 @@ Supports Intel Arc **discrete** GPUs (Alchemist DG2, Battlemage) **and** modern 
 ## Quick Start
 
 ```bash
-git clone https://git.no-signal.uk/nosignal/Intel-Arc-Gaming-Omarchy.git
+git clone https://github.com/28allday/Intel-Arc-Gaming-Omarchy.git
 cd Intel-Arc-Gaming-Omarchy
 chmod +x ARCGames_installv2.sh
 ./ARCGames_installv2.sh
